@@ -1,1 +1,1 @@
-# package init for utils
+# utils package
