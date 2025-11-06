@@ -49,7 +49,7 @@ st.caption("Modo 100% manual — salve projetos localmente e recupere depois")
 
 # ---------- Sidebar: project controls ----------
 st.sidebar.header("Projeto / Histórico")
-st.sidebar.header("Somente offline")
+st.sidebar.info("Apenas offline")
 db_path = Path(DB_FILENAME)
 ensure_db(db_path)
 
