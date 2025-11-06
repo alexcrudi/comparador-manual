@@ -1,101 +1,81 @@
+# app_manual.py
 import streamlit as st
 import pandas as pd
-from io import BytesIO
 from utils.manual import (
     ler_planilha_siga,
     ler_planilha_form,
     preparar_pareamento,
-    sugerir_candidatos,
     gerar_exportacao
 )
 from datetime import datetime
 
 st.set_page_config(page_title="Comparador Manual - SIGA x Formulário", layout="wide")
-st.title("📊 Comparador Manual — SIGA x Formulário (Formulário = Submission ID → Código Formulário)")
-st.caption("Visualização concatenada (Nome + Observações). Exporta XLSX com 3 abas: Pareados / Somente_SIGA / Somente_Formulário")
+st.title("📊 Comparador Manual — SIGA x Formulário (Manual 100%)")
+st.caption("Formato do dropdown: <Código Formulário> — <Nome> | <Observações>")
 
-# ---------- SIDEBAR ----------
+# ---------------- Sidebar ----------------
 with st.sidebar:
-    st.header("⚙️ Configurações & Upload")
-    st.markdown("Faça upload das planilhas abaixo (CSV ou XLSX).")
+    st.header("⚙️ Upload & Configurações")
+    st.markdown("Envie os arquivos (CSV ou XLSX).")
     siga_file = st.file_uploader("Arquivo SIGA", type=["csv", "xlsx"])
-    form_file = st.file_uploader("Arquivo Formulário (exportação do formulário)", type=["csv", "xlsx"])
-
-    st.markdown("---")
-    st.subheader("Sugestões (fuzzy)")
-    limiar = st.slider("Limiar mínimo para sugerir", 40, 95, 65)
-    top_k = st.number_input("Sugestões por item (k)", min_value=1, max_value=10, value=5)
-
+    form_file = st.file_uploader("Arquivo Formulário (exportação)", type=["csv", "xlsx"])
     st.markdown("---")
     st.subheader("Exibição")
     mostrar_preview = st.checkbox("Mostrar pré-visualização das planilhas", value=True)
-    st.markdown("Escolha colunas visíveis (UI somente) — você pode ocultar e reexibir a qualquer momento.")
+    st.markdown("Ocultar/mostrar colunas é apenas visual e NÃO altera a exportação.")
+    st.markdown("---")
+    st.info("Este modo é 100% manual: você decide o pareamento. Itens escolhidos não podem ser escolhidos novamente.")
 
-# ---------- Carregamento ----------
+# ---------------- Require uploads ----------------
 if not (siga_file and form_file):
-    st.info("Envie ambos os arquivos (SIGA e Formulário) na barra lateral para começar.")
+    st.info("Envie os dois arquivos na barra lateral para iniciar.")
     st.stop()
 
-# Ler planilhas (funções tratam nomes reais das colunas)
-siga_df = ler_planilha_siga(siga_file)
-form_df = ler_planilha_form(form_file)  # aqui Submission ID vira codigo_form internamente
+# ---------------- Ler planilhas ----------------
+try:
+    siga_df = ler_planilha_siga(siga_file)
+    form_df = ler_planilha_form(form_file)
+except Exception as e:
+    st.error(f"Erro ao ler arquivos: {e}")
+    st.stop()
 
-# Criar campos visuais (sem alterar originais)
-# SIGA: assume colunas originais como: Código, Nome, Fornecedor, Localidade, Conta, Nº Documento, Dependência, Dt. Aquisição, Vl. Aquisição, Vl. Deprec., Vl. Atual, Status
-siga_df = siga_df.copy()
+# garantir colunas observacao nas duas (vazias se não existirem)
 if "observacao" not in siga_df.columns:
-    # garante coluna observacao mesmo vazia para concat
     siga_df["observacao"] = ""
-
-siga_df["nome_visual"] = siga_df.apply(
-    lambda r: f"{r.get('nome','')}" + (f" ({r.get('observacao','')})" if r.get("observacao") else ""),
-    axis=1
-)
-
-# Formulário: campos reais fornecidos — criamos nome_visual a partir de "Nome / Tipo de Bens" + "Observações"
-form_df = form_df.copy()
-if "observacoes" not in form_df.columns and "observacao" not in form_df.columns:
-    # garantir chave 'observacao' com preferência por 'Observações' ou 'observacoes'
+if "observacao" not in form_df.columns:
     form_df["observacao"] = ""
-else:
-    # padronizar para 'observacao'
-    if "observacoes" in form_df.columns and "observacao" not in form_df.columns:
-        form_df = form_df.rename(columns={"observacoes": "observacao"})
 
-# nome_form já mapeado em ler_planilha_form como 'nome_form' e código como 'codigo_form'
-form_df["nome_visual"] = form_df.apply(
-    lambda r: f"{r.get('nome_form','')}" + (f" ({r.get('observacao','')})" if r.get("observacao") else ""),
-    axis=1
-)
+# criar campo visual (apenas para exibir)
+siga_df["nome_visual"] = siga_df.apply(lambda r: f"{r.get('nome','')}" + (f" | {r.get('observacao','')}" if r.get('observacao') else ""), axis=1)
+form_df["nome_visual"] = form_df.apply(lambda r: f"{r.get('nome_form','')}" + (f" | {r.get('observacao','')}" if r.get('observacao') else ""), axis=1)
 
-# ---------- Escolha de colunas visíveis (somente visual) ----------
+# ---------------- Colunas visíveis (multiselect) - visual only ----------------
 st.subheader("🔧 Ocultar / Mostrar Colunas (visual)")
 col1, col2 = st.columns(2)
-
 with col1:
-    cols_siga = st.multiselect(
-        "Colunas SIGA (visual)",
-        options=list(siga_df.columns),
-        default=["codigo", "nome_visual", "dependencia"]
-    )
+    cols_siga_default = ["codigo", "nome_visual", "dependencia"]
+    cols_siga = st.multiselect("Colunas SIGA (visual)", options=list(siga_df.columns), default=cols_siga_default)
 with col2:
-    cols_form = st.multiselect(
-        "Colunas Formulário (visual)",
-        options=list(form_df.columns),
-        default=["codigo_form", "nome_visual", "dependencia_form"]
-    )
+    # default pick codigo_form if exists else the first
+    default_form = ["codigo_form", "nome_visual", "dependencia_form"]
+    available_form_cols = list(form_df.columns)
+    # ensure defaults present in available
+    default_present = [c for c in default_form if c in available_form_cols]
+    if not default_present:
+        default_present = available_form_cols[:3] if len(available_form_cols) >= 3 else available_form_cols
+    cols_form = st.multiselect("Colunas Formulário (visual)", options=available_form_cols, default=default_present)
 
-# Mostrar previews (opcional)
+# previews
 if mostrar_preview:
     left, right = st.columns(2)
     with left:
-        st.subheader("📘 Preview SIGA")
+        st.subheader("📘 Preview SIGA (visual)")
         try:
             st.dataframe(siga_df[cols_siga], use_container_width=True, height=300)
         except Exception:
             st.dataframe(siga_df.head(10), use_container_width=True, height=300)
     with right:
-        st.subheader("📙 Preview Formulário")
+        st.subheader("📙 Preview Formulário (visual)")
         try:
             st.dataframe(form_df[cols_form], use_container_width=True, height=300)
         except Exception:
@@ -103,113 +83,174 @@ if mostrar_preview:
 
 st.markdown("---")
 
-# ---------- Preparar pareamento ----------
-pares_df, somente_siga, somente_form = preparar_pareamento(siga_df, form_df)
+# ---------------- Preparar pareamento ----------------
+pares_df, somente_siga_df, somente_form_df = preparar_pareamento(siga_df, form_df)
 
-st.subheader("🔗 Pareamento Manual — Lista de Itens SIGA")
-st.write("Use o campo de busca por linha ou o filtro global para restringir as opções do formulário. Ao selecionar um item do formulário, ele fica indisponível para outros itens (pareamento 1-para-1).")
+st.subheader("🔗 Pareamento Manual — Itens SIGA")
+st.write("Para cada item SIGA escolha manualmente o item correspondente do Formulário. Use o filtro global ou por linha para encontrar o item desejado. Uma vez selecionado, o item ficará indisponível para os outros (controle 1-para-1).")
 
-# global search para filtrar opções do formulário
-global_search = st.text_input("🔎 Buscar globalmente no formulário (filtra opções para todos)", value="", placeholder="ex: cadeira, R-001, microfone").strip().lower()
+# global search
+global_search = st.text_input("🔎 Buscar globalmente no formulário (filtra opções):", value="", placeholder="ex: banco, R-001, 2.50m").strip().lower()
 
-# container para controle de selecionados
-if "selecionados" not in st.session_state:
-    st.session_state["selecionados"] = set()
+# session_state structures to keep selections persistent
+if "selection_map" not in st.session_state:
+    # maps row_idx -> codigo_form (or None)
+    st.session_state.selection_map = {}
+if "selected_forms" not in st.session_state:
+    # set of codigo_form currently selected
+    st.session_state.selected_forms = set()
 
-# pré-cálculo de sugestões fuzzy (apenas para mostrar sugestão)
-sugestao_df = sugerir_candidatos(pares_df, form_df, k=top_k)
-# juntar sugestao_df na ordem de pares_df
-# garantimos que 'sugestao_df' tenha índice alinhado ao pares_df (mesma ordem)
-sugestao_df = sugestao_df.reindex(pares_df.index).reset_index(drop=True)
-
-# Loop para cada item SIGA
+# loop through itens SIGA
 pares_confirmados = []
 for idx, siga_row in pares_df.reset_index(drop=True).iterrows():
     codigo_siga = str(siga_row.get("codigo", ""))
     nome_siga = str(siga_row.get("nome", ""))
     nome_visual_siga = str(siga_row.get("nome_visual", nome_siga))
-    score_sug = int(sugestao_df.at[idx, "score"]) if ("score" in sugestao_df.columns and idx in sugestao_df.index) else None
-    melhor_code = sugestao_df.at[idx, "best_code"] if ("best_code" in sugestao_df.columns and idx in sugestao_df.index) else None
 
-    # cartão com informação e similaridade
-    st.markdown(
-        f"""
-        <div style="border:1px solid #e6e6e6;padding:12px;border-radius:8px;margin-bottom:8px;">
-            <b>{codigo_siga}</b> — <span style="font-size:1.05em">{nome_visual_siga}</span>
-            <div style="float:right;"><small>Sugestão: <b>{melhor_code or '-'}</b> | Score: <b>{score_sug if score_sug is not None else '-'}</b>%</small></div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    # display card with divider
+    st.markdown(f"**{codigo_siga} — {nome_visual_siga}**")
+    # per-row filter
+    filtro = st.text_input("🔎 Filtrar opções (por código/nome/obs):", key=f"filtro_{idx}", value="").strip().lower()
 
-    # campo de busca por linha (funcional)
-    filtro_key = f"filtro_{idx}"
-    filtro = st.text_input("🔎 Filtrar opções (por código/nome):", key=filtro_key, value="").strip().lower()
-
-    # construir opções filtradas
+    # build options DataFrame copy
     df_opts = form_df.copy()
 
-    # aplica filtro global
+    # apply global filter if present
     if global_search:
         mask_global = df_opts.apply(lambda r: r.astype(str).str.lower().str.contains(global_search, na=False)).any(axis=1)
         df_opts = df_opts[mask_global]
 
-    # aplica filtro linha
+    # apply per-row filter if present
     if filtro:
         mask_row = df_opts.apply(lambda r: r.astype(str).str.lower().str.contains(filtro, na=False)).any(axis=1)
         df_opts = df_opts[mask_row]
 
-    # remove já selecionados (1-para-1)
-    if st.session_state["selecionados"]:
-        df_opts = df_opts[~df_opts["codigo_form"].astype(str).isin(st.session_state["selecionados"])]
+    # remove already selected forms (1-para-1)
+    available_df = df_opts[~df_opts["codigo_form"].astype(str).isin(st.session_state.selected_forms)].copy()
 
-    # criar lista de opções formatadas
-    options = ["(Nenhum)"] + df_opts.apply(lambda r: f"{r.get('codigo_form','')} — {r.get('nome_visual','')}", axis=1).tolist()
+    # options list formatted: "<codigo_form> — <nome> | <observacao>"
+    def _fmt(r):
+        code = str(r.get("codigo_form", ""))
+        name = str(r.get("nome_form", ""))
+        obs = str(r.get("observacao", ""))
+        if obs:
+            return f"{code} — {name} | {obs}"
+        else:
+            return f"{code} — {name}"
 
-    sel_key = f"sel_{idx}"
-    escolha = st.selectbox("Selecionar item do formulário para parear:", options, key=sel_key, index=0)
+    options = ["(Nenhum)"] + [ _fmt(r) for _, r in available_df.iterrows() ]
 
-    codigo_form_escolhido = None
-    if escolha and escolha != "(Nenhum)":
-        codigo_form_escolhido = escolha.split(" — ")[0].strip()
-        # registra selecionado globalmente
-        st.session_state["selecionados"].add(codigo_form_escolhido)
+    # restore previous selection for this row if exists and still available; else default to "(Nenhum)"
+    prev = st.session_state.selection_map.get(str(idx), None)
+    # determine index for selectbox
+    index_default = 0
+    if prev:
+        # prev might have been removed by global filters; if prev not in current available_df keep "(Nenhum)"
+        prev_in_avail = prev in available_df["codigo_form"].astype(str).tolist()
+        if prev_in_avail:
+            # find position in options (offset +1 because of "(Nenhum)")
+            try:
+                index_default = 1 + available_df["codigo_form"].astype(str).tolist().index(prev)
+            except ValueError:
+                index_default = 0
+        else:
+            # keep the previous as selected but still show it so user can deselect
+            # we will prepend prev as a special option so user sees it and can change
+            if prev != "(Nenhum)":
+                # find details for prev to display
+                prev_row = form_df[form_df["codigo_form"].astype(str) == str(prev)]
+                if not prev_row.empty:
+                    prev_fmt = _fmt(prev_row.iloc[0])
+                else:
+                    prev_fmt = f"{prev} — (selecionado anteriormente)"
+                # ensure prev is first after "(Nenhum)"
+                options = ["(Nenhum)", prev_fmt] + [opt for opt in options[1:] if prev not in opt]
+                index_default = 1
 
-    # registra o par (mesmo que vazio)
-    pares_confirmados.append({
-        "codigo_siga": codigo_siga,
-        "nome_siga": nome_siga,
-        "observacao_siga": siga_row.get("observacao", ""),
-        "dependencia_siga": siga_row.get("dependencia", ""),
-        "codigo_form": codigo_form_escolhido,
-        "nome_form": form_df.loc[form_df["codigo_form"] == codigo_form_escolhido, "nome_form"].squeeze() if codigo_form_escolhido is not None else "",
-        "observacao_form": form_df.loc[form_df["codigo_form"] == codigo_form_escolhido, "observacao"].squeeze() if codigo_form_escolhido is not None else "",
-        "dependencia_form": form_df.loc[form_df["codigo_form"] == codigo_form_escolhido, "dependencia_form"].squeeze() if codigo_form_escolhido is not None else "",
-        "similaridade": score_sug if score_sug is not None else ""
-    })
+    sel = st.selectbox("Selecionar item do formulário para parear:", options, key=f"sel_{idx}", index=index_default)
+
+    # process selection change: map selection string to code
+    chosen_code = None
+    if sel and sel != "(Nenhum)":
+        # extract code before first " — "
+        if " — " in sel:
+            chosen_code = sel.split(" — ")[0].strip()
+        else:
+            chosen_code = sel.strip()
+
+    # update session_state.selected_forms and selection_map accordingly
+    prev_selected = st.session_state.selection_map.get(str(idx), None)
+    if prev_selected and prev_selected != chosen_code:
+        # user changed selection: remove previous from global selected set
+        if prev_selected in st.session_state.selected_forms:
+            st.session_state.selected_forms.discard(prev_selected)
+
+    if chosen_code:
+        # add new chosen
+        st.session_state.selected_forms.add(chosen_code)
+        st.session_state.selection_map[str(idx)] = chosen_code
+    else:
+        # none chosen
+        if str(idx) in st.session_state.selection_map:
+            # remove previous mapping
+            prev_v = st.session_state.selection_map.pop(str(idx))
+            if prev_v in st.session_state.selected_forms:
+                st.session_state.selected_forms.discard(prev_v)
+
+    # prepare registro para export
+    chosen_row = {}
+    chosen_row["codigo_siga"] = codigo_siga
+    chosen_row["nome_siga"] = nome_siga
+    chosen_row["observacao_siga"] = siga_row.get("observacao", "")
+    chosen_row["dependencia_siga"] = siga_row.get("dependencia", "")
+
+    if chosen_code:
+        fr = form_df[form_df["codigo_form"].astype(str) == str(chosen_code)]
+        if not fr.empty:
+            fr = fr.iloc[0].to_dict()
+            chosen_row["codigo_form"] = fr.get("codigo_form", "")
+            chosen_row["nome_form"] = fr.get("nome_form", "")
+            chosen_row["observacao_form"] = fr.get("observacao", "")
+            chosen_row["dependencia_form"] = fr.get("dependencia_form", "")
+        else:
+            # fallback empty
+            chosen_row["codigo_form"] = chosen_code
+            chosen_row["nome_form"] = ""
+            chosen_row["observacao_form"] = ""
+            chosen_row["dependencia_form"] = ""
+    else:
+        chosen_row["codigo_form"] = ""
+        chosen_row["nome_form"] = ""
+        chosen_row["observacao_form"] = ""
+        chosen_row["dependencia_form"] = ""
+
+    pares_confirmados.append(chosen_row)
 
     st.markdown("---")
 
-# ---------- Após loop: preparar DataFrames finais ----------
+# ---------------- Construir dataframes finais ----------------
 pareados_df = pd.DataFrame(pares_confirmados)
 
-# Itens somente no SIGA -> aqueles cujo codigo_siga aparece e codigo_form é None ou '(Nenhum)'
-somente_siga_df = siga_df[~siga_df["codigo"].isin(pareados_df[pareados_df["codigo_form"].notna()]["codigo_siga"])].copy()
-# Observação: acima assume que itens pareados possuem codigo_form não nulo. Para incluir todos os não pareados:
-somente_siga_df = siga_df[~siga_df["codigo"].isin(pareados_df[pareados_df["codigo_form"].notna()]["codigo_siga"])]
+# Itens somente no SIGA: aqueles códigos SIGA que não possuem codigo_form preenchido
+somente_siga_df = somente_siga_df = somente_siga_df = None
+try:
+    somente_siga_df = siga_df[~siga_df["codigo"].astype(str).isin(pareados_df[pareados_df["codigo_form"].astype(str) != "" ]["codigo_siga"].astype(str))]
+except Exception:
+    somente_siga_df = siga_df.copy()
 
-# Itens somente no Formulário -> aqueles cujo codigo_form não foi selecionado por nenhum pares_confirmados
-selecionados_forms = set(pareados_df["codigo_form"].dropna().astype(str).tolist())
+# Itens somente no Formulário: aqueles codigo_form que não aparecem em pareados_df
+selecionados_forms = set(pareados_df[pareados_df["codigo_form"].astype(str) != ""]["codigo_form"].astype(str).tolist())
 somente_form_df = form_df[~form_df["codigo_form"].astype(str).isin(selecionados_forms)].copy()
 
-st.success("Conferência concluída na UI. Agora você pode exportar os resultados.")
+st.success("Conferência construída na interface. Se necessário ajuste seleções antes de exportar.")
 
-# ---------- Exportar: XLSX com 3 abas ----------
-st.subheader("📤 Exportar Resultado")
-nome_base = st.text_input("Nome base do arquivo:", value=f"comparador_manual_{datetime.now().strftime('%Y%m%d_%H%M')}")
+# ---------------- Exportação ----------------
+st.subheader("📤 Exportar Resultado (XLSX com 3 abas)")
 
-col_exp1, col_exp2 = st.columns(2)
-with col_exp1:
+nome_base = st.text_input("Nome base do arquivo", value=f"comparador_manual_{datetime.now().strftime('%Y%m%d_%H%M')}")
+
+col1, col2 = st.columns(2)
+with col1:
     if st.button("Gerar XLSX (3 abas)"):
         xlsx_bytes = gerar_exportacao(
             pareados_df,
@@ -222,7 +263,7 @@ with col_exp1:
         )
         st.success("XLSX pronto.")
         st.download_button("⬇️ Baixar XLSX", data=xlsx_bytes.getvalue(), file_name=f"{nome_base}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-with col_exp2:
+with col2:
     if st.button("Gerar ZIP (CSVs)"):
         zip_bytes = gerar_exportacao(
             pareados_df,
@@ -233,8 +274,8 @@ with col_exp2:
             nome_base=nome_base,
             compact=True
         )
-        st.success("ZIP com CSVs pronto.")
+        st.success("ZIP pronto.")
         st.download_button("⬇️ Baixar ZIP", data=zip_bytes.getvalue(), file_name=f"{nome_base}.zip", mime="application/zip")
 
 st.sidebar.markdown("---")
-st.sidebar.write("Comparador Manual — exporta tudo em XLSX (3 abas).")
+st.sidebar.write("Comparador Manual — 100% manual, itens exclusivos por seleção.")
