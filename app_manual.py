@@ -1,126 +1,450 @@
+# app_manual.py
+# Versão estável recuperada + melhorias visuais nos dropdowns (código, nome, observação, dependência)
+# Cole inteiro no seu projeto, substituindo o que houver.
+
+import os
 import streamlit as st
 import pandas as pd
-import os
-from utils.manual import carregar_csv_siga, carregar_csv_form, preparar_dados_para_visual, \
-                         gerar_excel_completo, gerar_csv_completo, gerar_codigo_unico
+import sqlite3
+from io import BytesIO
+from datetime import datetime
 
-# -------------------------
-# CONFIGURAÇÃO DO APP
-# -------------------------
-st.set_page_config(
-    page_title="Comparador Manual de Inventário",
-    layout="wide",
-)
+st.set_page_config(page_title="Comparador Manual de Inventário", layout="wide")
 
-st.title("📊 Comparador Manual de Inventário")
+# ----------------- Helpers (leitura / limpeza / mapeamento) -----------------
+def _read_table(uploaded):
+    name = getattr(uploaded, "name", "")
+    # tenta CSV com autodetecção de separador; fallback para excel
+    if str(name).lower().endswith(".csv"):
+        try:
+            return pd.read_csv(uploaded, dtype=str, keep_default_na=False).fillna("")
+        except Exception:
+            return pd.read_csv(uploaded, dtype=str, encoding="latin-1", keep_default_na=False).fillna("")
+    else:
+        return pd.read_excel(uploaded, dtype=str).fillna("")
 
-st.markdown("""
-Sistema desenvolvido para facilitar a comparação manual entre:
 
-✅ Planilha SIGA  
-✅ Planilha de Formulário (Tally ou qualquer outra)  
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # trim nos nomes de coluna
+    df.columns = [str(c).strip() for c in df.columns]
+    # remover colunas Unnamed
+    df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", na=False)]
+    # remover colunas completamente vazias
+    non_empty = [c for c in df.columns if not df[c].astype(str).str.strip().eq("").all()]
+    if non_empty:
+        df = df[non_empty]
+    return df
 
-Os arquivos **NÃO são enviados para a internet**, tudo roda localmente.
-""")
 
-# -------------------------
-# UPLOAD DOS ARQUIVOS
-# -------------------------
-st.header("📁 Importar arquivos")
+def _find_column(df: pd.DataFrame, candidates):
+    cols = list(df.columns)
+    # exata (case-insensitive)
+    for cand in candidates:
+        for c in cols:
+            if c.strip().lower() == cand.strip().lower():
+                return c
+    # contains fallback
+    for cand in candidates:
+        for c in cols:
+            if cand.strip().lower() in c.strip().lower():
+                return c
+    return None
 
-uploaded_siga = st.file_uploader("Selecione o arquivo do SIGA (.csv)", type=["csv"])
-uploaded_form = st.file_uploader("Selecione o arquivo do Formulário (.csv)", type=["csv"])
 
-if not uploaded_siga or not uploaded_form:
-    st.info("⏳ Aguarde… envie os dois arquivos para continuar.")
+def ensure_projects_dir(path="projetos"):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def generate_unique_codes(base_ids):
+    # base_ids: list of strings; cria suffixes para duplicatas
+    counts = {}
+    for b in base_ids:
+        counts[b] = counts.get(b, 0) + 1
+    seq = {}
+    out = []
+    for b in base_ids:
+        b = str(b)
+        if counts.get(b, 0) <= 1 or b.strip() == "":
+            out.append(b)
+        else:
+            seq[b] = seq.get(b, 0) + 1
+            out.append(f"{b}-{seq[b]:02d}")
+    return out
+
+
+def _safe_get(r, candidates, default=""):
+    for c in candidates:
+        if c in r and pd.notna(r[c]):
+            return str(r[c])
+    return default
+
+
+# ----------------- Project selector (creates projects inside ./projetos) -----------------
+PROJECTS_DIR = ensure_projects_dir("projetos")
+st.sidebar.header("Projeto")
+mode = st.sidebar.radio("", ["Criar novo projeto", "Abrir projeto existente"])
+project_name = None
+
+if mode == "Criar novo projeto":
+    new_name = st.sidebar.text_input("Nome do novo projeto")
+    if st.sidebar.button("Criar projeto"):
+        if new_name and new_name.strip():
+            project_path = os.path.join(PROJECTS_DIR, new_name.strip())
+            os.makedirs(project_path, exist_ok=True)
+            st.sidebar.success(f"Projeto '{new_name.strip()}' criado. Agora selecione 'Abrir projeto existente'.")
+            st.experimental_rerun()
+        else:
+            st.sidebar.error("Digite um nome válido.")
+    st.sidebar.info("Após criar, mude para 'Abrir projeto existente' para selecioná-lo.")
+    st.stop()
+else:
+    existing = sorted([p for p in os.listdir(PROJECTS_DIR) if os.path.isdir(os.path.join(PROJECTS_DIR, p))])
+    if not existing:
+        st.sidebar.warning("Nenhum projeto encontrado. Crie um novo projeto primeiro.")
+        st.stop()
+    project_name = st.sidebar.selectbox("Selecione o projeto", existing)
+    project_path = os.path.join(PROJECTS_DIR, project_name)
+    st.sidebar.write(f"Pasta do projeto: {project_path}")
+
+st.title(f"Comparador Manual — Projeto: {project_name}")
+
+# ----------------- Uploads -----------------
+st.header("1) Carregue as planilhas")
+col1, col2 = st.columns(2)
+with col1:
+    file_siga = st.file_uploader("SIGA (CSV ou XLSX)", type=["csv", "xlsx"], key="u_siga")
+with col2:
+    file_form = st.file_uploader("Formulário (CSV ou XLSX)", type=["csv", "xlsx"], key="u_form")
+
+if not (file_siga and file_form):
+    st.info("Envie ambos os arquivos para começar (SIGA e Formulário).")
     st.stop()
 
-# -------------------------
-# CARREGAR DATAFRAMES
-# -------------------------
-df_siga = carregar_csv_siga(uploaded_siga)
-df_form = carregar_csv_form(uploaded_form)
+# ----------------- Read & clean -----------------
+try:
+    siga_df = _read_table(file_siga)
+    form_df = _read_table(file_form)
+except Exception as e:
+    st.error(f"Erro ao ler arquivos: {e}")
+    st.stop()
 
-# Gerar códigos únicos para itens repetidos do formulário
-df_form["codigo_formulario"] = [
-    gerar_codigo_unico(i) for i in range(len(df_form))
-]
+siga_df = _clean_df(siga_df)
+form_df = _clean_df(form_df)
 
-# Criar coluna visual somente para o FORMULÁRIO
-df_form["nome_visual"] = df_form.apply(
-    lambda row: f"{row.get('Nome', '')} — {row.get('Observações', '')}".strip(" —"),
+# ----------------- Identify important columns (robusto) -----------------
+siga_code_col = _find_column(siga_df, ["Código", "Codigo", "CODIGO", "Cód. Item", "ID", "Cod"])
+siga_name_col = _find_column(siga_df, ["Nome", "Nome do Bem", "Descrição", "Descricao", "Item", "ITEM"])
+siga_dep_col = _find_column(siga_df, ["Dependência", "Dependencia", "Dependência / Local", "Localidade", "Local"])
+
+form_code_col = _find_column(form_df, ["Submission ID", "SubmissionID", "codigo_form", "codigo_formulario", "ID", "id"])
+form_name_col = _find_column(form_df, ["Nome / Tipo de Bens", "Nome", "name", "Item", "Tipo"])
+form_obs_col = _find_column(form_df, ["Observações", "Observacoes", "Observacao", "Obs", "observacao"])
+form_dep_col = _find_column(form_df, ["Dependência / Localização", "Dependência", "Dependencia", "Local"])
+
+# fallback guarantees
+if siga_code_col is None:
+    siga_df = siga_df.reset_index().rename(columns={"index": "Código"})
+    siga_code_col = "Código"
+if siga_name_col is None:
+    siga_df["Nome"] = ""
+    siga_name_col = "Nome"
+if siga_dep_col is None:
+    siga_df["Dependência"] = ""
+    siga_dep_col = "Dependência"
+
+if form_code_col is None:
+    form_df = form_df.reset_index().rename(columns={"index": "Submission ID"})
+    form_code_col = "Submission ID"
+if form_name_col is None:
+    form_df["Nome / Tipo de Bens"] = ""
+    form_name_col = "Nome / Tipo de Bens"
+if form_obs_col is None:
+    form_df["Observações"] = ""
+    form_obs_col = "Observações"
+if form_dep_col is None:
+    form_df["Dependência / Localização"] = ""
+    form_dep_col = "Dependência / Localização"
+
+# normalize strings
+siga_df[siga_code_col] = siga_df[siga_code_col].astype(str).str.strip()
+siga_df[siga_name_col] = siga_df[siga_name_col].astype(str).str.strip()
+siga_df[siga_dep_col] = siga_df[siga_dep_col].astype(str).str.strip()
+
+form_df[form_code_col] = form_df[form_code_col].astype(str).str.strip()
+form_df[form_name_col] = form_df[form_name_col].astype(str).str.strip()
+form_df[form_obs_col] = form_df[form_obs_col].astype(str).str.strip()
+form_df[form_dep_col] = form_df[form_dep_col].astype(str).str.strip()
+
+# ----------------- Generate unique form codes when duplicates exist -----------------
+base_ids = form_df[form_code_col].astype(str).tolist()
+# if Submission ID empty, provide a base id like FORMIDX to avoid blank keys
+base_ids_normalized = [b if b.strip() != "" else f"__FROW__{i}" for i, b in enumerate(base_ids)]
+unique_codes = generate_unique_codes(base_ids_normalized)
+# prefer readable code: if original Submission ID non-empty use it (with suffix if duplicate),
+# else convert __FROW__ index into FORM-00001 style
+final_codes = []
+auto_counter = 1
+for orig, uniq in zip(base_ids, unique_codes):
+    if orig.strip() != "":
+        final_codes.append(uniq)
+    else:
+        final_codes.append(f"FORM-{auto_counter:05d}")
+        auto_counter += 1
+form_df["codigo_form"] = final_codes
+
+# ----------------- Visual columns -----------------
+siga_df["codigo_siga"] = siga_df[siga_code_col]
+siga_df["nome_siga"] = siga_df[siga_name_col]
+siga_df["dependencia_siga"] = siga_df[siga_dep_col]
+
+form_df["nome_form"] = form_df[form_name_col]
+form_df["observacao_form"] = form_df[form_obs_col]
+form_df["dependencia_form"] = form_df[form_dep_col]
+
+form_df["nome_visual"] = form_df.apply(
+    lambda r: f"{r['nome_form']}" + (f" — {r['observacao_form']}" if str(r['observacao_form']).strip() else ""),
+    axis=1
+)
+siga_df["nome_visual"] = siga_df["nome_siga"]  # SIGA name is already full
+
+# ----------------- Column visibility controls -----------------
+st.subheader("2) Colunas (visual)")
+col_siga_choices = [c for c in siga_df.columns if not str(c).startswith("__")]
+col_form_choices = [c for c in form_df.columns if not str(c).startswith("__")]
+
+cols = st.columns(2)
+with cols[0]:
+    default_siga = ["codigo_siga", "nome_visual", "dependencia_siga"]
+    visible_siga = st.multiselect("Colunas SIGA (visual)", options=col_siga_choices, default=[c for c in default_siga if c in col_siga_choices])
+with cols[1]:
+    default_form = ["codigo_form", "nome_visual", "dependencia_form"]
+    visible_form = st.multiselect("Colunas Formulário (visual)", options=col_form_choices, default=[c for c in default_form if c in col_form_choices])
+
+# preview
+st.subheader("3) Pré-visualização (visual)")
+left, right = st.columns(2)
+with left:
+    st.write("SIGA")
+    st.dataframe(siga_df[visible_siga] if visible_siga else siga_df.head(10), use_container_width=True, height=300)
+with right:
+    st.write("Formulário")
+    st.dataframe(form_df[visible_form] if visible_form else form_df.head(10), use_container_width=True, height=300)
+
+st.markdown("---")
+
+# ----------------- Prepare pairing UI (manual, one-to-one) -----------------
+st.subheader("4) Pareamento Manual (100% manual)")
+global_search = st.text_input("🔎 Buscar globalmente no formulário (filtra opções):", value="", placeholder="ex: banco, FORM-00001, 2.50m").strip().lower()
+
+if "selections" not in st.session_state:
+    st.session_state.selections = {}  # codigo_siga -> codigo_form
+if "selected_forms" not in st.session_state:
+    st.session_state.selected_forms = set()
+
+pareados_for_export = []
+
+# Pre-generate formatted option strings for performance
+form_df["option_display"] = form_df.apply(
+    lambda r: f"{r['codigo_form']} — {r['nome_visual']}" + (f"  |  Dep: {r['dependencia_form']}" if str(r['dependencia_form']).strip() else ""),
     axis=1
 )
 
-# SIGA usa apenas o nome real
-df_siga["nome_visual"] = df_siga["Nome"]
+# iterate SIGA rows
+for idx, srow in siga_df.reset_index(drop=True).iterrows():
+    codigo_siga = str(srow.get("codigo_siga", f"SIGA_{idx}"))
+    nome_visual_siga = str(srow.get("nome_visual", "")) + (f"  |  Dep: {srow.get('dependencia_siga','')}" if str(srow.get('dependencia_siga','')).strip() else "")
 
-# -------------------------
-# PREPARAR LISTA DE OPÇÕES
-# -------------------------
-opcoes_form = (
-    df_form.apply(
-        lambda r: f"{r['codigo_formulario']} | {r['nome_visual']}",
-        axis=1
-    ).tolist()
-)
+    st.markdown(f"**{codigo_siga} — {nome_visual_siga}**")
 
-# -------------------------
-# TABELA PRINCIPAL DE COMPARAÇÃO
-# -------------------------
-st.header("✅ Comparação Manual")
+    filtro = st.text_input("🔎 Filtrar opções (por código/nome/obs/dep):", key=f"filtro_{idx}", value="").strip().lower()
 
-st.markdown("""
-Selecione manualmente qual item do formulário corresponde a cada item do SIGA.
+    df_opts = form_df.copy()
+    # apply global and row filters
+    if global_search:
+        mask_global = df_opts.apply(lambda r: r.astype(str).str.lower().str.contains(global_search, na=False)).any(axis=1)
+        df_opts = df_opts[mask_global]
+    if filtro:
+        mask_row = df_opts.apply(lambda r: r.astype(str).str.lower().str.contains(filtro, na=False)).any(axis=1)
+        df_opts = df_opts[mask_row]
 
-Cada escolha só pode ser usada **uma vez**.
-""")
+    # options exclude already selected in this session (1-para-1)
+    available_df = df_opts[~df_opts["codigo_form"].astype(str).isin(st.session_state.selected_forms)].copy()
 
-pareamentos = {}
+    # build options list
+    options = ["(Nenhum)"] + available_df["option_display"].tolist()
 
-with st.form("form_comparacao"):
-    for idx, row in df_siga.iterrows():
-        col1, col2 = st.columns([1.3, 2])
+    # restore previous selection if any
+    prev = st.session_state.selections.get(codigo_siga, "")
+    index_default = 0
+    if prev:
+        # if prev still available, select it; otherwise add it as first option so user can see it
+        if prev in available_df["codigo_form"].astype(str).tolist():
+            index_default = 1 + available_df["codigo_form"].astype(str).tolist().index(prev)
+        else:
+            prev_row = form_df[form_df["codigo_form"].astype(str) == str(prev)]
+            if not prev_row.empty:
+                prev_fmt = prev_row.iloc[0]["option_display"]
+            else:
+                prev_fmt = f"{prev} — (anterior)"
+            options = ["(Nenhum)", prev_fmt] + [o for o in options[1:] if prev not in o]
+            index_default = 1
 
-        with col1:
-            st.markdown(f"**SIGA:** `{row['Código']}` — {row['Nome']}")
+    sel = st.selectbox("Selecionar item do formulário para parear:", options, key=f"sel_{idx}", index=index_default)
 
-        with col2:
-            escolha = st.selectbox(
-                f"Selecione o correspondente do Formulário para o item do SIGA {row['Código']}:",
-                ["(Nenhum)"] + opcoes_form,
-                key=f"sel_{idx}"
-            )
-            pareamentos[idx] = escolha
+    chosen_code = None
+    if sel and sel != "(Nenhum)":
+        # extract code part (before " — ")
+        if " — " in sel:
+            chosen_code = sel.split(" — ")[0].strip()
+        else:
+            chosen_code = sel.strip()
 
-    submit = st.form_submit_button("💾 Salvar pareamentos")
+    # update session_state selected_forms to prevent reuse
+    prev_code = st.session_state.selections.get(codigo_siga, "")
+    if prev_code and prev_code != chosen_code:
+        if prev_code in st.session_state.selected_forms:
+            st.session_state.selected_forms.discard(prev_code)
+    if chosen_code:
+        st.session_state.selected_forms.add(chosen_code)
+        st.session_state.selections[codigo_siga] = chosen_code
+    else:
+        if codigo_siga in st.session_state.selections:
+            old = st.session_state.selections.pop(codigo_siga)
+            if old in st.session_state.selected_forms:
+                st.session_state.selected_forms.discard(old)
 
-if submit:
-    st.success("✅ Pareamentos salvos com sucesso!")
+    # prepare row for export
+    chosen_row = {
+        "codigo_siga": codigo_siga,
+        "nome_siga": srow.get(siga_name_col, srow.get("nome_siga", "")),
+        "observacao_siga": srow.get("observacao", ""),
+        "dependencia_siga": srow.get(siga_dep_col, srow.get("dependencia_siga", "")),
+        "codigo_form": "",
+        "nome_form": "",
+        "observacao_form": "",
+        "dependencia_form": ""
+    }
+    if chosen_code:
+        fr = form_df[form_df["codigo_form"].astype(str) == str(chosen_code)]
+        if not fr.empty:
+            fr = fr.iloc[0].to_dict()
+            chosen_row["codigo_form"] = fr.get("codigo_form", "")
+            chosen_row["nome_form"] = fr.get("nome_form", "")
+            chosen_row["observacao_form"] = fr.get("observacao_form", "")
+            chosen_row["dependencia_form"] = fr.get("dependencia_form", "")
+    pareados_for_export.append(chosen_row)
 
-# -------------------------
-# EXPORTAÇÃO FINAL
-# -------------------------
-st.header("📤 Exportar Resultados")
+    st.markdown("---")
 
-if st.button("📘 Exportar XLSX Completo"):
-    caminho = gerar_excel_completo(df_siga, df_form, pareamentos)
-    st.success(f"Arquivo gerado: `{caminho}`")
-    with open(caminho, "rb") as f:
-        st.download_button("📥 Baixar XLSX", f, file_name="comparacao_completa.xlsx")
+# ----------------- Save / Export -----------------
+st.subheader("5) Salvar / Exportar resultados")
+col_a, col_b = st.columns(2)
+with col_a:
+    if st.button("💾 Salvar pareamentos no projeto"):
+        if not project_name:
+            st.error("Selecione um projeto válido na barra lateral.")
+        else:
+            db_path = os.path.join(project_path, "history.db")
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pareamentos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    codigo_siga TEXT, nome_siga TEXT, observacao_siga TEXT, dependencia_siga TEXT,
+                    codigo_form TEXT, nome_form TEXT, observacao_form TEXT, dependencia_form TEXT,
+                    usuario TEXT, timestamp TEXT
+                )
+            """)
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            for r in pareados_for_export:
+                cur.execute(
+                    "INSERT INTO pareamentos (codigo_siga, nome_siga, observacao_siga, dependencia_siga, codigo_form, nome_form, observacao_form, dependencia_form, usuario, timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        r.get("codigo_siga",""),
+                        r.get("nome_siga",""),
+                        r.get("observacao_siga",""),
+                        r.get("dependencia_siga",""),
+                        r.get("codigo_form",""),
+                        r.get("nome_form",""),
+                        r.get("observacao_form",""),
+                        r.get("dependencia_form",""),
+                        "local",
+                        now
+                    )
+                )
+            conn.commit()
+            conn.close()
+            st.success(f"Pareamentos salvos em: {os.path.join(project_path, 'history.db')}")
 
-if st.button("📄 Exportar CSV Completo"):
-    caminho_csv = gerar_csv_completo(df_siga, df_form, pareamentos)
-    st.success(f"Arquivo gerado: `{caminho_csv}`")
-    with open(caminho_csv, "rb") as f:
-        st.download_button("📥 Baixar CSV", f, file_name="comparacao_completa.csv")
+with col_b:
+    nome_base = st.text_input("Nome base do arquivo exportado", value=f"comparacao_{datetime.now().strftime('%Y%m%d_%H%M')}")
+    if st.button("📤 Exportar XLSX e CSV"):
+        # build pareados full table
+        siga_full = siga_df.copy().reset_index(drop=True)
+        form_full = form_df.copy().reset_index(drop=True)
+        # create pareados combined
+        pareados_out = []
+        for r in pareados_for_export:
+            codigo_siga = r.get("codigo_siga","")
+            siga_rows = siga_full[siga_full["codigo_siga"].astype(str) == str(codigo_siga)]
+            siga_row = siga_rows.iloc[0].to_dict() if not siga_rows.empty else {}
+            codigo_form = r.get("codigo_form","")
+            form_row = {}
+            if codigo_form:
+                fr = form_full[form_full["codigo_form"].astype(str) == str(codigo_form)]
+                if not fr.empty:
+                    form_row = fr.iloc[0].to_dict()
+            combined = {}
+            for c in siga_full.columns:
+                combined[f"SIGA__{c}"] = siga_row.get(c, "")
+            for c in form_full.columns:
+                combined[f"FORM__{c}"] = form_row.get(c, "")
+            combined["Status"] = "Pareado" if codigo_form else "Pendente"
+            pareados_out.append(combined)
+        pareados_df = pd.DataFrame(pareados_out)
+        # somente_siga
+        somente_siga_out = []
+        for _, r in siga_full.iterrows():
+            row = {}
+            for c in siga_full.columns:
+                row[f"SIGA__{c}"] = r.get(c, "")
+            for c in form_full.columns:
+                row[f"FORM__{c}"] = ""
+            row["Status"] = "Somente_SIGA"
+            somente_siga_out.append(row)
+        somente_siga_df = pd.DataFrame(somente_siga_out)
+        # somente_form
+        somente_form_out = []
+        for _, r in form_full.iterrows():
+            row = {}
+            for c in siga_full.columns:
+                row[f"SIGA__{c}"] = ""
+            for c in form_full.columns:
+                row[f"FORM__{c}"] = r.get(c, "")
+            row["Status"] = "Somente_Formulario"
+            somente_form_out.append(row)
+        somente_form_df = pd.DataFrame(somente_form_out)
+        # xlsx
+        xlsx_path = os.path.join(project_path, f"{nome_base}.xlsx")
+        with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+            pareados_df.to_excel(writer, index=False, sheet_name="Pareados")
+            somente_siga_df.to_excel(writer, index=False, sheet_name="Somente_SIGA")
+            somente_form_df.to_excel(writer, index=False, sheet_name="Somente_Formulário")
+        # csv combined
+        frames = [df for df in [pareados_df, somente_siga_df, somente_form_df] if not df.empty]
+        if frames:
+            csv_all = pd.concat(frames, ignore_index=True, sort=False)
+        else:
+            csv_all = pd.DataFrame()
+        csv_path = os.path.join(project_path, f"{nome_base}.csv")
+        csv_all.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        st.success("Exportação concluída")
+        with open(xlsx_path, "rb") as f:
+            st.download_button("⬇️ Baixar XLSX", data=f, file_name=os.path.basename(xlsx_path))
+        with open(csv_path, "rb") as f:
+            st.download_button("⬇️ Baixar CSV", data=f, file_name=os.path.basename(csv_path))
 
-# -------------------------
-# RODAPÉ
-# -------------------------
 st.markdown("---")
-st.markdown("""
-**Comparador Manual de Inventário**  
-Desenvolvido com apoio de ChatGPT  
-**Contato:** Alex Crudi — 📱 (15) 9.9127-6070
-""")
+st.markdown("Comparador Manual — Desenvolvido por Alex Crudi — 📱 (15) 9.9127-6070")
